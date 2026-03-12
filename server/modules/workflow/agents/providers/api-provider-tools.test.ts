@@ -108,4 +108,36 @@ describe("api provider tools", () => {
 
     expect(parseSSEStream).not.toHaveBeenCalled();
   });
+
+  it("includes the target URL when fetch fails before a response arrives", async () => {
+    const provider: ApiProviderRow = {
+      id: "provider-3",
+      name: "OpenCode Go",
+      type: "openai",
+      base_url: "https://opencode.ai/zen/go/v1",
+      api_key_enc: null,
+      preset_key: "opencode-go-openai",
+      enabled: 1,
+      models_cache: JSON.stringify(["glm-5"]),
+      models_cached_at: 1_717_171_717_000,
+    };
+    const { executeApiProviderAgent, parseSSEStream } = createHarness(provider);
+    const fetchMock = vi.fn().mockRejectedValue(new TypeError("fetch failed"));
+    vi.stubGlobal("fetch", fetchMock as unknown as typeof fetch);
+
+    await expect(
+      executeApiProviderAgent(
+        "hello",
+        "C:\\repo",
+        {} as never,
+        new AbortController().signal,
+        undefined,
+        provider.id,
+        null,
+        () => true,
+      ),
+    ).rejects.toThrow("Failed to reach https://opencode.ai/zen/go/v1/chat/completions");
+
+    expect(parseSSEStream).not.toHaveBeenCalled();
+  });
 });

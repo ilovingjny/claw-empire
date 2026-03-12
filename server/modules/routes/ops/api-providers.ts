@@ -1,4 +1,4 @@
-import type { Express, Request, Response } from "express";
+import type { Express, Request, Response as ExpressResponse } from "express";
 import type { DatabaseSync, SQLInputValue } from "node:sqlite";
 import { randomUUID } from "node:crypto";
 import { decryptSecret, encryptSecret } from "../../../oauth/helpers.ts";
@@ -152,6 +152,8 @@ const PROBE_MODEL_DISCOVERY_PRESETS = new Set<OfficialApiProviderPresetKey>([
 ]);
 
 const PROBE_MODEL_OVERRIDES: Partial<Record<OfficialApiProviderPresetKey, string>> = {
+  "opencode-go-openai": "glm-5",
+  "opencode-go-anthropic": "minimax-m2.5",
   "alibaba-coding-plan-openai": "qwen3-coder-plus",
   "alibaba-coding-plan-anthropic": "qwen3-coder-plus",
 };
@@ -285,6 +287,19 @@ function validateOfficialPresetApiKey(preset: OfficialApiProviderPreset | null, 
   return null;
 }
 
+function resolveApiKeyForPresetValidation(params: {
+  officialPreset: OfficialApiProviderPreset | null;
+  incomingApiKey: string | null;
+  retainedEncryptedApiKey: string | null;
+  shouldReuseStoredKey: boolean;
+}): string {
+  const { officialPreset, incomingApiKey, retainedEncryptedApiKey, shouldReuseStoredKey } = params;
+  if (!officialPreset) return "";
+  if (incomingApiKey !== null) return incomingApiKey;
+  if (!shouldReuseStoredKey || !retainedEncryptedApiKey) return "";
+  return decryptSecret(retainedEncryptedApiKey);
+}
+
 function shouldUseProbeModelDiscovery(
   presetKey: string | null | undefined,
 ): presetKey is OfficialApiProviderPresetKey {
@@ -332,6 +347,14 @@ function summarizeUpstreamErrorBody(value: string): string {
     // fall through to raw text summary
   }
   return trimmed.slice(0, 500);
+}
+
+function summarizeFetchFailure(error: unknown, url: string): string | null {
+  const message = error instanceof Error ? error.message : String(error);
+  if (/fetch failed/i.test(message)) {
+    return `Failed to reach ${url}. Check your network, firewall, TLS proxy, or whether the endpoint is available.`;
+  }
+  return null;
 }
 
 function buildConnectionProbeRequest(
@@ -392,12 +415,17 @@ async function refreshProviderModels(
       return { ok: false, error: "No probe model is configured for this preset." };
     }
     const req = buildConnectionProbeRequest(row.type, row.base_url, apiKey, probeModel);
-    const resp = await fetch(req.url, {
-      method: "POST",
-      headers: req.headers,
-      body: req.body,
-      signal: AbortSignal.timeout(15_000),
-    });
+    let resp: globalThis.Response;
+    try {
+      resp = await fetch(req.url, {
+        method: "POST",
+        headers: req.headers,
+        body: req.body,
+        signal: AbortSignal.timeout(15_000),
+      });
+    } catch (error) {
+      return { ok: false, error: summarizeFetchFailure(error, req.url) ?? String(error) };
+    }
     if (!resp.ok) {
       const errBody = await resp.text().catch(() => "");
       return {
@@ -414,10 +442,15 @@ async function refreshProviderModels(
 
   const url = buildModelsUrl(row.type, row.base_url, apiKey);
   const headers = buildApiProviderHeaders(row.type, apiKey);
-  const resp = await fetch(url, {
-    headers,
-    signal: AbortSignal.timeout(15_000),
-  });
+  let resp: globalThis.Response;
+  try {
+    resp = await fetch(url, {
+      headers,
+      signal: AbortSignal.timeout(15_000),
+    });
+  } catch (error) {
+    return { ok: false, error: summarizeFetchFailure(error, url) ?? String(error) };
+  }
   if (!resp.ok) {
     const errBody = await resp.text().catch(() => "");
     return {
@@ -446,7 +479,7 @@ async function refreshProviderModels(
   };
 }
 
-function sendNotFound(res: Response): void {
+function sendNotFound(res: ExpressResponse): void {
   res.status(404).json({ error: "not_found" });
 }
 
@@ -534,6 +567,7 @@ export function registerApiProviderRoutes({ app, db, nowMs }: RegisterApiProvide
     const existingPresetKey = existingPreset?.key ?? null;
     const incomingApiKey = "api_key" in body ? (typeof body.api_key === "string" ? body.api_key.trim() : "") : null;
     const isPresetTransition = presetKeyInput != null && presetKeyInput.presetKey !== existingPresetKey;
+    const shouldReuseStoredKeyForValidation = incomingApiKey === null && isPresetTransition;
     const nextManualType = "type" in body && isApiProviderType(body.type) ? body.type : row.type;
     const nextManualBaseUrl =
       "base_url" in body && typeof body.base_url === "string" && body.base_url.trim()
@@ -551,8 +585,13 @@ export function registerApiProviderRoutes({ app, db, nowMs }: RegisterApiProvide
       params.push(body.name.trim());
     }
     if (officialPreset && (incomingApiKey !== null || isPresetTransition)) {
-      const retainedApiKey = row.api_key_enc ? decryptSecret(row.api_key_enc) : "";
-      const apiKeyError = validateOfficialPresetApiKey(officialPreset, incomingApiKey ?? retainedApiKey);
+      const apiKeyToValidate = resolveApiKeyForPresetValidation({
+        officialPreset,
+        incomingApiKey,
+        retainedEncryptedApiKey: row.api_key_enc,
+        shouldReuseStoredKey: shouldReuseStoredKeyForValidation,
+      });
+      const apiKeyError = validateOfficialPresetApiKey(officialPreset, apiKeyToValidate);
       if (apiKeyError) {
         return res.status(400).json({ error: apiKeyError });
       }

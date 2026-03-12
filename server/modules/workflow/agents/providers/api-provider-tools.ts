@@ -5,6 +5,8 @@ import { decryptSecret } from "../../../../oauth/helpers.ts";
 import type { ApiProviderRow } from "./types.ts";
 
 const DEFAULT_MODEL_OVERRIDES: Record<string, string> = {
+  "opencode-go-openai": "glm-5",
+  "opencode-go-anthropic": "minimax-m2.5",
   "alibaba-coding-plan-openai": "qwen3-coder-plus",
   "alibaba-coding-plan-anthropic": "qwen3-coder-plus",
 };
@@ -140,6 +142,14 @@ export function createApiProviderTools(deps: CreateApiProviderToolsDeps) {
     return trimmed.slice(0, 500);
   }
 
+  function summarizeFetchFailure(error: unknown, url: string): string | null {
+    const message = error instanceof Error ? error.message : String(error);
+    if (/fetch failed/i.test(message)) {
+      return `Failed to reach ${url}. Check your network, firewall, TLS proxy, or whether the endpoint is available.`;
+    }
+    return null;
+  }
+
   function resolveDefaultModel(provider: ApiProviderRow, cachedModels: readonly string[]): string | null {
     const presetKey = typeof provider.preset_key === "string" ? provider.preset_key : "";
     const preferredModel = presetKey ? DEFAULT_MODEL_OVERRIDES[presetKey] : "";
@@ -269,12 +279,18 @@ export function createApiProviderTools(deps: CreateApiProviderToolsDeps) {
 
     const req = buildApiProviderRequest(provider, model, prompt, projectPath);
 
-    const resp = await fetch(req.url, {
-      method: "POST",
-      headers: req.headers,
-      body: req.body,
-      signal,
-    });
+    let resp: Response;
+    try {
+      resp = await fetch(req.url, {
+        method: "POST",
+        headers: req.headers,
+        body: req.body,
+        signal,
+      });
+    } catch (error) {
+      const detail = summarizeFetchFailure(error, req.url) ?? (error instanceof Error ? error.message : String(error));
+      throw new Error(`API provider '${provider.name}' request failed: ${detail}`);
+    }
 
     if (!resp.ok) {
       const text = await resp.text();
