@@ -33,6 +33,7 @@ export interface ApiProviderRow {
   type: ApiProviderType;
   base_url: string;
   api_key_enc: string | null;
+  preset_key?: string | null;
   enabled: number;
   models_cache: string | null;
   models_cached_at: number | null;

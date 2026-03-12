@@ -4,6 +4,11 @@ import type { ChildProcess } from "node:child_process";
 import { decryptSecret } from "../../../../oauth/helpers.ts";
 import type { ApiProviderRow } from "./types.ts";
 
+const DEFAULT_MODEL_OVERRIDES: Record<string, string> = {
+  "alibaba-coding-plan-openai": "qwen3-coder-plus",
+  "alibaba-coding-plan-anthropic": "qwen3-coder-plus",
+};
+
 type DbLike = {
   prepare: (sql: string) => {
     get: (...args: any[]) => unknown;
@@ -93,15 +98,63 @@ export function createApiProviderTools(deps: CreateApiProviderToolsDeps) {
     );
   }
 
+  function parseModelsCache(value: string | null): string[] {
+    if (!value) return [];
+    try {
+      const parsed = JSON.parse(value);
+      return Array.isArray(parsed) ? parsed.map((item) => String(item ?? "").trim()).filter(Boolean) : [];
+    } catch {
+      return [];
+    }
+  }
+
+  function looksLikeHtmlResponse(value: string): boolean {
+    return /^\s*<!doctype html/i.test(value) || /^\s*<html\b/i.test(value);
+  }
+
+  function summarizeUpstreamErrorBody(value: string): string {
+    const trimmed = value.trim();
+    if (!trimmed) return "";
+    if (looksLikeHtmlResponse(trimmed)) {
+      return "Upstream returned HTML instead of a streaming API response. Check that the Base URL and API key target the direct API endpoint.";
+    }
+    try {
+      const parsed = JSON.parse(trimmed) as {
+        error?: { message?: unknown } | string;
+        message?: unknown;
+      };
+      if (typeof parsed.error === "string" && parsed.error.trim()) return parsed.error.trim();
+      if (
+        parsed.error &&
+        typeof parsed.error === "object" &&
+        "message" in parsed.error &&
+        typeof parsed.error.message === "string" &&
+        parsed.error.message.trim()
+      ) {
+        return parsed.error.message.trim();
+      }
+      if (typeof parsed.message === "string" && parsed.message.trim()) return parsed.message.trim();
+    } catch {
+      // fall through to raw text summary
+    }
+    return trimmed.slice(0, 500);
+  }
+
+  function resolveDefaultModel(provider: ApiProviderRow, cachedModels: readonly string[]): string | null {
+    const presetKey = typeof provider.preset_key === "string" ? provider.preset_key : "";
+    const preferredModel = presetKey ? DEFAULT_MODEL_OVERRIDES[presetKey] : "";
+    if (preferredModel) {
+      return cachedModels.includes(preferredModel) ? preferredModel : preferredModel;
+    }
+    return cachedModels[0] ?? null;
+  }
+
   function resolveApiProviderModel(provider: ApiProviderRow, requestedModel: string | null): string {
     if (requestedModel) return requestedModel;
-    if (provider.models_cache) {
-      try {
-        const models = JSON.parse(provider.models_cache) as string[];
-        if (models.length > 0) return models[0];
-      } catch {
-        /* ignore */
-      }
+    const cachedModels = parseModelsCache(provider.models_cache);
+    const defaultModel = resolveDefaultModel(provider, cachedModels);
+    if (defaultModel) {
+      return defaultModel;
     }
     throw new Error(
       `No model specified for API provider '${provider.name}'. ` +
@@ -225,15 +278,29 @@ export function createApiProviderTools(deps: CreateApiProviderToolsDeps) {
 
     if (!resp.ok) {
       const text = await resp.text();
-      throw new Error(`API provider '${provider.name}' error (${resp.status}): ${text}`);
+      const detail = summarizeUpstreamErrorBody(text) || `upstream returned ${resp.status}`;
+      throw new Error(`API provider '${provider.name}' error (${resp.status}): ${detail}`);
+    }
+
+    const contentType = resp.headers.get("content-type") ?? "";
+    if (contentType && !/text\/event-stream/i.test(contentType)) {
+      const text = await resp.text().catch(() => "");
+      const detail =
+        summarizeUpstreamErrorBody(text) ||
+        `Unexpected content-type '${contentType}'. The provider did not return a streaming API response.`;
+      throw new Error(`API provider '${provider.name}' returned unexpected response: ${detail}`);
+    }
+
+    if (!resp.body) {
+      throw new Error(`API provider '${provider.name}' returned an empty response body.`);
     }
 
     if (provider.type === "anthropic") {
-      await parseAnthropicSSEStream(resp.body!, signal, safeWrite, taskId);
+      await parseAnthropicSSEStream(resp.body, signal, safeWrite, taskId);
     } else if (provider.type === "google") {
-      await parseGeminiSSEStream(resp.body!, signal, safeWrite, taskId);
+      await parseGeminiSSEStream(resp.body, signal, safeWrite, taskId);
     } else {
-      await parseSSEStream(resp.body!, signal, safeWrite, taskId);
+      await parseSSEStream(resp.body, signal, safeWrite, taskId);
     }
 
     safeWrite(`\n---\n[api:${provider.type}] Done.\n`);

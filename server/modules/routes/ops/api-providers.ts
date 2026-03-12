@@ -144,6 +144,18 @@ const OFFICIAL_API_PROVIDER_PRESETS = {
 
 type OfficialApiProviderPresetKey = keyof typeof OFFICIAL_API_PROVIDER_PRESETS;
 
+const PROBE_MODEL_DISCOVERY_PRESETS = new Set<OfficialApiProviderPresetKey>([
+  "opencode-go-openai",
+  "opencode-go-anthropic",
+  "alibaba-coding-plan-openai",
+  "alibaba-coding-plan-anthropic",
+]);
+
+const PROBE_MODEL_OVERRIDES: Partial<Record<OfficialApiProviderPresetKey, string>> = {
+  "alibaba-coding-plan-openai": "qwen3-coder-plus",
+  "alibaba-coding-plan-anthropic": "qwen3-coder-plus",
+};
+
 function isApiProviderType(value: unknown): value is ApiProviderType {
   return typeof value === "string" && value in API_PROVIDER_PRESETS;
 }
@@ -271,6 +283,167 @@ function validateOfficialPresetApiKey(preset: OfficialApiProviderPreset | null, 
     return `API key for ${preset.label} must start with ${preset.required_api_key_prefix}`;
   }
   return null;
+}
+
+function shouldUseProbeModelDiscovery(
+  presetKey: string | null | undefined,
+): presetKey is OfficialApiProviderPresetKey {
+  return Boolean(presetKey && isOfficialApiProviderPresetKey(presetKey) && PROBE_MODEL_DISCOVERY_PRESETS.has(presetKey));
+}
+
+function resolveProbeModel(
+  presetKey: string | null | undefined,
+  officialPreset: OfficialApiProviderPreset | null,
+  cachedModels: readonly string[],
+): string {
+  if (presetKey && isOfficialApiProviderPresetKey(presetKey) && PROBE_MODEL_OVERRIDES[presetKey]) {
+    return PROBE_MODEL_OVERRIDES[presetKey] ?? "";
+  }
+  return officialPreset?.fallback_models[0] ?? cachedModels[0] ?? "";
+}
+
+function looksLikeHtmlResponse(value: string): boolean {
+  return /^\s*<!doctype html/i.test(value) || /^\s*<html\b/i.test(value);
+}
+
+function summarizeUpstreamErrorBody(value: string): string {
+  const trimmed = value.trim();
+  if (!trimmed) return "";
+  if (looksLikeHtmlResponse(trimmed)) {
+    return "Upstream returned HTML instead of an API response. Check that the Base URL points to a direct API endpoint.";
+  }
+  try {
+    const parsed = JSON.parse(trimmed) as {
+      error?: { message?: unknown } | string;
+      message?: unknown;
+    };
+    if (typeof parsed.error === "string" && parsed.error.trim()) return parsed.error.trim();
+    if (
+      parsed.error &&
+      typeof parsed.error === "object" &&
+      "message" in parsed.error &&
+      typeof parsed.error.message === "string" &&
+      parsed.error.message.trim()
+    ) {
+      return parsed.error.message.trim();
+    }
+    if (typeof parsed.message === "string" && parsed.message.trim()) return parsed.message.trim();
+  } catch {
+    // fall through to raw text summary
+  }
+  return trimmed.slice(0, 500);
+}
+
+function buildConnectionProbeRequest(
+  type: ApiProviderType,
+  baseUrl: string,
+  apiKey: string,
+  model: string,
+): { url: string; headers: Record<string, string>; body: string } {
+  const base = normalizeApiBaseUrl(baseUrl);
+  if (type === "anthropic") {
+    const url = base.endsWith("/v1") ? `${base}/messages` : `${base}/v1/messages`;
+    return {
+      url,
+      headers: {
+        Accept: "application/json",
+        "Content-Type": "application/json",
+        "x-api-key": apiKey,
+        "anthropic-version": "2023-06-01",
+      },
+      body: JSON.stringify({
+        model,
+        max_tokens: 1,
+        stream: false,
+        messages: [{ role: "user", content: "ping" }],
+      }),
+    };
+  }
+
+  const url = /\/v\d+$/.test(base) ? `${base}/chat/completions` : `${base}/v1/chat/completions`;
+  return {
+    url,
+    headers: {
+      Accept: "application/json",
+      "Content-Type": "application/json",
+      ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
+    },
+    body: JSON.stringify({
+      model,
+      stream: false,
+      max_tokens: 1,
+      messages: [{ role: "user", content: "ping" }],
+    }),
+  };
+}
+
+async function refreshProviderModels(
+  row: ApiProviderRow,
+  officialPreset: OfficialApiProviderPreset | null,
+): Promise<
+  | { ok: true; models: string[] }
+  | { ok: false; status?: number; error: string }
+> {
+  const apiKey = row.api_key_enc ? decryptSecret(row.api_key_enc) : "";
+  if (shouldUseProbeModelDiscovery(row.preset_key)) {
+    const cachedModels = parseModelsCache(row.models_cache);
+    const probeModel = resolveProbeModel(row.preset_key, officialPreset, cachedModels);
+    if (!probeModel) {
+      return { ok: false, error: "No probe model is configured for this preset." };
+    }
+    const req = buildConnectionProbeRequest(row.type, row.base_url, apiKey, probeModel);
+    const resp = await fetch(req.url, {
+      method: "POST",
+      headers: req.headers,
+      body: req.body,
+      signal: AbortSignal.timeout(15_000),
+    });
+    if (!resp.ok) {
+      const errBody = await resp.text().catch(() => "");
+      return {
+        ok: false,
+        status: resp.status,
+        error: summarizeUpstreamErrorBody(errBody) || `upstream returned ${resp.status}`,
+      };
+    }
+    return {
+      ok: true,
+      models: mergeModelLists(officialPreset?.fallback_models ?? [], cachedModels),
+    };
+  }
+
+  const url = buildModelsUrl(row.type, row.base_url, apiKey);
+  const headers = buildApiProviderHeaders(row.type, apiKey);
+  const resp = await fetch(url, {
+    headers,
+    signal: AbortSignal.timeout(15_000),
+  });
+  if (!resp.ok) {
+    const errBody = await resp.text().catch(() => "");
+    return {
+      ok: false,
+      status: resp.status,
+      error: summarizeUpstreamErrorBody(errBody) || `upstream returned ${resp.status}`,
+    };
+  }
+
+  const text = await resp.text().catch(() => "");
+  let data: unknown;
+  try {
+    data = text ? JSON.parse(text) : {};
+  } catch {
+    return {
+      ok: false,
+      status: resp.status,
+      error:
+        summarizeUpstreamErrorBody(text) ||
+        "Upstream returned a non-JSON response while loading models. Check that the Base URL is a model-list endpoint.",
+    };
+  }
+  return {
+    ok: true,
+    models: mergeModelLists(officialPreset?.fallback_models ?? [], extractModelIds(row.type, data)),
+  };
 }
 
 function sendNotFound(res: Response): void {
@@ -455,30 +628,20 @@ export function registerApiProviderRoutes({ app, db, nowMs }: RegisterApiProvide
     if (!row) return sendNotFound(res);
 
     const officialPreset = readOfficialPreset(row.preset_key)?.preset ?? null;
-    const apiKey = row.api_key_enc ? decryptSecret(row.api_key_enc) : "";
-    const url = buildModelsUrl(row.type, row.base_url, apiKey);
-    const headers = buildApiProviderHeaders(row.type, apiKey);
 
     try {
-      const resp = await fetch(url, {
-        headers,
-        signal: AbortSignal.timeout(15_000),
-      });
-      if (!resp.ok) {
-        const errBody = await resp.text().catch(() => "");
-        return res.json({ ok: false, status: resp.status, error: errBody.slice(0, 500) });
+      const result = await refreshProviderModels(row, officialPreset);
+      if (!result.ok) {
+        return res.json({ ok: false, status: result.status, error: result.error });
       }
-
-      const data = await resp.json();
-      const models = mergeModelLists(officialPreset?.fallback_models ?? [], extractModelIds(row.type, data));
       const now = nowMs();
       db.prepare("UPDATE api_providers SET models_cache = ?, models_cached_at = ?, updated_at = ? WHERE id = ?").run(
-        JSON.stringify(models),
+        JSON.stringify(result.models),
         now,
         now,
         id,
       );
-      res.json({ ok: true, model_count: models.length, models });
+      res.json({ ok: true, model_count: result.models.length, models: result.models });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       res.json({ ok: false, error: message });
@@ -497,28 +660,22 @@ export function registerApiProviderRoutes({ app, db, nowMs }: RegisterApiProvide
       return res.json({ ok: true, models: cachedModels, cached: true });
     }
 
-    const apiKey = row.api_key_enc ? decryptSecret(row.api_key_enc) : "";
-    const url = buildModelsUrl(row.type, row.base_url, apiKey);
-    const headers = buildApiProviderHeaders(row.type, apiKey);
-
     try {
-      const resp = await fetch(url, { headers, signal: AbortSignal.timeout(15_000) });
-      if (!resp.ok) {
+      const result = await refreshProviderModels(row, officialPreset);
+      if (!result.ok) {
         if (row.models_cache) {
           return res.json({ ok: true, models: cachedModels, cached: true, stale: true });
         }
-        return res.status(502).json({ error: `upstream returned ${resp.status}` });
+        return res.status(502).json({ error: result.error });
       }
-      const data = await resp.json();
-      const models = mergeModelLists(officialPreset?.fallback_models ?? [], extractModelIds(row.type, data));
       const now = nowMs();
       db.prepare("UPDATE api_providers SET models_cache = ?, models_cached_at = ?, updated_at = ? WHERE id = ?").run(
-        JSON.stringify(models),
+        JSON.stringify(result.models),
         now,
         now,
         id,
       );
-      res.json({ ok: true, models, cached: false });
+      res.json({ ok: true, models: result.models, cached: false });
     } catch (error) {
       if (row.models_cache) {
         return res.json({ ok: true, models: cachedModels, cached: true, stale: true });

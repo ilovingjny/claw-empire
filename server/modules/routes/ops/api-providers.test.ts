@@ -200,7 +200,6 @@ describe("api provider routes", () => {
       db.close();
     }
   });
-
   it("replaces stale cached models when switching into a preset", async () => {
     const { app, db } = await createHarness();
 
@@ -309,8 +308,7 @@ describe("api provider routes", () => {
       db.close();
     }
   });
-
-  it("merges fetched models with preset fallback models during test", async () => {
+  it("uses the OpenCode Go OpenAI probe endpoint during connection tests", async () => {
     const { app, db } = await createHarness();
 
     try {
@@ -321,21 +319,191 @@ describe("api provider routes", () => {
         preset_key: "opencode-go-openai",
       });
 
-      const fetchMock = vi.fn().mockResolvedValueOnce(jsonResponse({ data: [{ id: "glm-5" }, { id: "deepseek-v3" }] }));
+      const fetchMock = vi.fn().mockResolvedValueOnce(jsonResponse({ id: "chatcmpl-probe" }));
       vi.stubGlobal("fetch", fetchMock as unknown as typeof fetch);
 
       const response = await request(app).post(`/api/api-providers/${createResponse.body.id}/test`).expect(200);
 
       expect(response.body).toMatchObject({
         ok: true,
-        model_count: 3,
-        models: ["glm-5", "kimi-k2.5", "deepseek-v3"],
+        model_count: 2,
+        models: ["glm-5", "kimi-k2.5"],
+      });
+      expect(fetchMock).toHaveBeenCalledWith(
+        "https://opencode.ai/zen/go/v1/chat/completions",
+        expect.objectContaining({
+          method: "POST",
+          signal: expect.any(AbortSignal),
+          headers: expect.objectContaining({
+            Accept: "application/json",
+            "Content-Type": "application/json",
+          }),
+          body: expect.any(String),
+        }),
+      );
+      expect(JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body))).toMatchObject({
+        model: "glm-5",
+        stream: false,
+        max_tokens: 1,
       });
 
       const row = db.prepare("SELECT models_cache FROM api_providers WHERE id = ?").get(createResponse.body.id) as {
         models_cache: string | null;
       };
-      expect(JSON.parse(String(row.models_cache))).toEqual(["glm-5", "kimi-k2.5", "deepseek-v3"]);
+      expect(JSON.parse(String(row.models_cache))).toEqual(["glm-5", "kimi-k2.5"]);
+    } finally {
+      db.close();
+    }
+  });
+
+  it("uses the OpenCode Go Anthropic probe endpoint during model refresh", async () => {
+    const { app, db } = await createHarness();
+
+    try {
+      const createResponse = await request(app).post("/api/api-providers").send({
+        name: "OpenCode Go Anthropic",
+        type: "anthropic",
+        base_url: "https://ignored.example",
+        preset_key: "opencode-go-anthropic",
+      });
+
+      const fetchMock = vi.fn().mockResolvedValueOnce(jsonResponse({ id: "msg_probe", type: "message" }));
+      vi.stubGlobal("fetch", fetchMock as unknown as typeof fetch);
+
+      const response = await request(app)
+        .get(`/api/api-providers/${createResponse.body.id}/models?refresh=true`)
+        .expect(200);
+
+      expect(response.body).toMatchObject({
+        ok: true,
+        cached: false,
+        models: ["minimax-m2.5"],
+      });
+      expect(fetchMock).toHaveBeenCalledWith(
+        "https://opencode.ai/zen/go/v1/messages",
+        expect.objectContaining({
+          method: "POST",
+          signal: expect.any(AbortSignal),
+          headers: expect.objectContaining({
+            Accept: "application/json",
+            "Content-Type": "application/json",
+            "anthropic-version": "2023-06-01",
+          }),
+          body: expect.any(String),
+        }),
+      );
+      expect(JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body))).toMatchObject({
+        model: "minimax-m2.5",
+        stream: false,
+        max_tokens: 1,
+      });
+    } finally {
+      db.close();
+    }
+  });
+
+  it("uses the Bailian Coding Plan OpenAI probe endpoint during connection tests", async () => {
+    const { app, db } = await createHarness();
+
+    try {
+      const createResponse = await request(app).post("/api/api-providers").send({
+        name: "Bailian Coding Plan",
+        type: "openai",
+        base_url: "https://ignored.example",
+        preset_key: "alibaba-coding-plan-openai",
+      });
+
+      const fetchMock = vi.fn().mockResolvedValueOnce(jsonResponse({ id: "chatcmpl-bailian-probe" }));
+      vi.stubGlobal("fetch", fetchMock as unknown as typeof fetch);
+
+      const response = await request(app).post(`/api/api-providers/${createResponse.body.id}/test`).expect(200);
+
+      expect(response.body).toMatchObject({
+        ok: true,
+        model_count: 8,
+        models: [
+          "qwen3.5-plus",
+          "kimi-k2.5",
+          "glm-5",
+          "MiniMax-M2.5",
+          "qwen3-max-2026-01-23",
+          "qwen3-coder-next",
+          "qwen3-coder-plus",
+          "glm-4.7",
+        ],
+      });
+      expect(fetchMock).toHaveBeenCalledWith(
+        "https://coding-intl.dashscope.aliyuncs.com/v1/chat/completions",
+        expect.objectContaining({
+          method: "POST",
+          signal: expect.any(AbortSignal),
+          headers: expect.objectContaining({
+            Accept: "application/json",
+            "Content-Type": "application/json",
+          }),
+          body: expect.any(String),
+        }),
+      );
+      expect(JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body))).toMatchObject({
+        model: "qwen3-coder-plus",
+        stream: false,
+        max_tokens: 1,
+      });
+    } finally {
+      db.close();
+    }
+  });
+
+  it("uses the Bailian Coding Plan Anthropic probe endpoint during model refresh", async () => {
+    const { app, db } = await createHarness();
+
+    try {
+      const createResponse = await request(app).post("/api/api-providers").send({
+        name: "Bailian Coding Plan Anthropic",
+        type: "anthropic",
+        base_url: "https://ignored.example",
+        preset_key: "alibaba-coding-plan-anthropic",
+      });
+
+      const fetchMock = vi.fn().mockResolvedValueOnce(jsonResponse({ id: "msg-bailian-probe", type: "message" }));
+      vi.stubGlobal("fetch", fetchMock as unknown as typeof fetch);
+
+      const response = await request(app)
+        .get(`/api/api-providers/${createResponse.body.id}/models?refresh=true`)
+        .expect(200);
+
+      expect(response.body).toMatchObject({
+        ok: true,
+        cached: false,
+        models: [
+          "qwen3.5-plus",
+          "kimi-k2.5",
+          "glm-5",
+          "MiniMax-M2.5",
+          "qwen3-max-2026-01-23",
+          "qwen3-coder-next",
+          "qwen3-coder-plus",
+          "glm-4.7",
+        ],
+      });
+      expect(fetchMock).toHaveBeenCalledWith(
+        "https://coding-intl.dashscope.aliyuncs.com/apps/anthropic/v1/messages",
+        expect.objectContaining({
+          method: "POST",
+          signal: expect.any(AbortSignal),
+          headers: expect.objectContaining({
+            Accept: "application/json",
+            "Content-Type": "application/json",
+            "anthropic-version": "2023-06-01",
+          }),
+          body: expect.any(String),
+        }),
+      );
+      expect(JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body))).toMatchObject({
+        model: "qwen3-coder-plus",
+        stream: false,
+        max_tokens: 1,
+      });
     } finally {
       db.close();
     }
@@ -372,6 +540,19 @@ describe("api provider routes", () => {
         "qwen3-coder-plus",
         "glm-4.7",
       ]);
+      expect(fetchMock).toHaveBeenCalledWith(
+        "https://coding-intl.dashscope.aliyuncs.com/v1/chat/completions",
+        expect.objectContaining({
+          method: "POST",
+          signal: expect.any(AbortSignal),
+          body: expect.any(String),
+        }),
+      );
+      expect(JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body))).toMatchObject({
+        model: "qwen3-coder-plus",
+        stream: false,
+        max_tokens: 1,
+      });
     } finally {
       db.close();
     }
