@@ -300,10 +300,10 @@ function resolveApiKeyForPresetValidation(params: {
   return decryptSecret(retainedEncryptedApiKey);
 }
 
-function shouldUseProbeModelDiscovery(
-  presetKey: string | null | undefined,
-): presetKey is OfficialApiProviderPresetKey {
-  return Boolean(presetKey && isOfficialApiProviderPresetKey(presetKey) && PROBE_MODEL_DISCOVERY_PRESETS.has(presetKey));
+function shouldUseProbeModelDiscovery(presetKey: string | null | undefined): presetKey is OfficialApiProviderPresetKey {
+  return Boolean(
+    presetKey && isOfficialApiProviderPresetKey(presetKey) && PROBE_MODEL_DISCOVERY_PRESETS.has(presetKey),
+  );
 }
 
 function resolveProbeModel(
@@ -357,6 +357,41 @@ function summarizeFetchFailure(error: unknown, url: string): string | null {
   return null;
 }
 
+async function validateProbeSuccessResponse(
+  resp: globalThis.Response,
+): Promise<{ ok: true } | { ok: false; error: string }> {
+  const contentType = resp.headers.get("content-type") ?? "";
+  const bodyText = await resp.text().catch(() => "");
+
+  if (looksLikeHtmlResponse(bodyText) || /text\/html/i.test(contentType)) {
+    return {
+      ok: false,
+      error:
+        "Upstream returned HTML instead of an API response. Check that the Base URL points to a direct API endpoint.",
+    };
+  }
+
+  if (!bodyText.trim()) {
+    return {
+      ok: false,
+      error: "Upstream returned an empty response body for the preset probe.",
+    };
+  }
+
+  try {
+    JSON.parse(bodyText);
+  } catch {
+    return {
+      ok: false,
+      error:
+        summarizeUpstreamErrorBody(bodyText) ||
+        "Upstream returned a non-JSON response for the preset probe. Check that the Base URL points to a direct API endpoint.",
+    };
+  }
+
+  return { ok: true };
+}
+
 function buildConnectionProbeRequest(
   type: ApiProviderType,
   baseUrl: string,
@@ -403,10 +438,7 @@ function buildConnectionProbeRequest(
 async function refreshProviderModels(
   row: ApiProviderRow,
   officialPreset: OfficialApiProviderPreset | null,
-): Promise<
-  | { ok: true; models: string[] }
-  | { ok: false; status?: number; error: string }
-> {
+): Promise<{ ok: true; models: string[] } | { ok: false; status?: number; error: string }> {
   const apiKey = row.api_key_enc ? decryptSecret(row.api_key_enc) : "";
   if (shouldUseProbeModelDiscovery(row.preset_key)) {
     const cachedModels = parseModelsCache(row.models_cache);
@@ -433,6 +465,10 @@ async function refreshProviderModels(
         status: resp.status,
         error: summarizeUpstreamErrorBody(errBody) || `upstream returned ${resp.status}`,
       };
+    }
+    const validated = await validateProbeSuccessResponse(resp);
+    if (!validated.ok) {
+      return { ok: false, status: resp.status, error: validated.error };
     }
     return {
       ok: true,

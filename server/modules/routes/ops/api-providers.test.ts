@@ -629,4 +629,37 @@ describe("api provider routes", () => {
       db.close();
     }
   });
+
+  it("rejects HTML 200 responses during preset probe tests", async () => {
+    const { app, db } = await createHarness();
+
+    try {
+      const createResponse = await request(app).post("/api/api-providers").send({
+        name: "OpenCode Go",
+        type: "openai",
+        base_url: "https://ignored.example",
+        preset_key: "opencode-go-openai",
+      });
+
+      const fetchMock = vi.fn().mockResolvedValueOnce(
+        new Response("<!DOCTYPE html><html><body>web page</body></html>", {
+          status: 200,
+          headers: { "content-type": "text/html; charset=utf-8" },
+        }),
+      );
+      vi.stubGlobal("fetch", fetchMock as unknown as typeof fetch);
+
+      const response = await request(app).post(`/api/api-providers/${createResponse.body.id}/test`).expect(200);
+
+      expect(response.body.ok).toBe(false);
+      expect(response.body.error).toContain("Upstream returned HTML instead of an API response");
+
+      const row = db.prepare("SELECT models_cache FROM api_providers WHERE id = ?").get(createResponse.body.id) as {
+        models_cache: string | null;
+      };
+      expect(JSON.parse(String(row.models_cache))).toEqual(["glm-5", "kimi-k2.5"]);
+    } finally {
+      db.close();
+    }
+  });
 });
